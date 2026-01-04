@@ -1,0 +1,348 @@
+# =========================
+# SPIKE PRIME FLL – Gyro PID Drive + FAST PID Turns + Attachment Motor (B)
+# Ports:
+#Drive Left= E
+#Drive Right = A
+#Attachment= B
+#
+# Features:
+# - Reset yaw ONCE at start
+# - Gyro straight with PID (P + I + D) + reverse steering fix (stable in reverse)
+# - Distance by average encoders (L+R)/2
+# - Smooth speed ramp (accelerate + slow down near target)
+# - Turn to ABSOLUTE heading with FAST PD + slow zone + min push
+# - Attachment control on motor B: up/down by degrees + optional "go to position"
+#
+# Notes:
+# - If your yaw sign feels reversed, flip YAW_SIGN below.
+# - If attachment up/down is reversed, flip ATT_DIR below (+1 / -1).
+# =========================
+
+from hub import port, motion_sensor
+import runloop, motor, motor_pair
+
+# ----- MOTORS -----
+PAIR = motor_pair.PAIR_1
+LEFT = port.E
+RIGHT = port.A
+ATT = port.B
+
+motor_pair.pair(PAIR, LEFT, RIGHT)
+
+# =========================
+# TUNING
+# =========================
+
+# Wheel circumference in cm (measure yours if you want max accuracy)
+WHEEL_CIRCUMFERENCE_CM = 17.6
+
+# Yaw sign (some robots / conventions feel reversed)
+YAW_SIGN = 1
+
+# Attachment direction (flip if up/down is reversed)
+ATT_DIR = 1# set -1 if your "up" goes down
+
+# ----- Straight PID -----
+KP_STRAIGHT = 1.1
+KI_STRAIGHT = 0.02
+KD_STRAIGHT = 0.20
+
+MAX_STEER = 100
+I_CLAMP = 200# clamp integral to avoid wind-up
+
+# Drive speeds
+DRIVE_MAX_VEL = 360
+DRIVE_MIN_VEL = 140
+
+# Ramp zones (in wheel-degrees)
+DRIVE_SLOW_ZONE_DEG = 220
+DRIVE_ACCEL_ZONE_DEG = 180
+
+# ----- Turn control (FASTER) -----
+KP_TURN = 3.0
+KD_TURN = 0.35
+TURN_FAST_CAP = 320
+TURN_SLOW_CAP = 160
+TURN_SLOW_ZONE_DEG = 8
+TURN_DEADBAND = 0.9
+MIN_TURN_PUSH = 55
+
+# Loop delays
+DT_STRAIGHT_MS = 10
+DT_TURN_MS = 6
+
+# Attachment defaults
+ATT_SPEED = 350# 250-450 typical
+ATT_HOLD = motor.BRAKE
+
+# =========================
+# HELPERS
+# =========================
+
+def clamp(x, lo, hi):
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+def yaw_deg():
+    # tilt_angles()[0] is yaw in tenths of degrees (approx)
+    return (motion_sensor.tilt_angles()[0] * -0.1) * YAW_SIGN
+
+def wrap_angle(err):
+    while err > 180:
+        err -= 360
+    while err < -180:
+        err += 360
+    return err
+
+async def gyro_reset_once():
+    motion_sensor.reset_yaw(0)
+    await runloop.sleep_ms(200)
+
+def cm_to_motor_deg(cm):
+    return int((abs(cm) / WHEEL_CIRCUMFERENCE_CM) * 360)
+
+def avg_abs_encoder_deg():
+    l = abs(motor.relative_position(LEFT))
+    r = abs(motor.relative_position(RIGHT))
+    return (l + r) // 2
+
+def ramp_speed(pos_deg, target_deg, max_vel, min_vel, accel_zone, slow_zone):
+    remaining = target_deg - pos_deg
+    if remaining <= 0:
+        return 0
+
+    # accelerate
+    if pos_deg < accel_zone:
+        a = pos_deg / accel_zone
+    else:
+        a = 1.0
+
+    # slow down
+    if remaining < slow_zone:
+        s = remaining / slow_zone
+    else:
+        s = 1.0
+
+    factor = min(a, 1.0) * min(s, 1.0)
+    v = min_vel + (max_vel - min_vel) * factor
+    return int(v)
+
+# =========================
+# ATTACHMENT (MOTOR B)
+# =========================
+
+def attachment_reset_zero():
+    motor.reset_relative_position(ATT, 0)
+
+async def attachment_up(deg=180, speed=ATT_SPEED):
+    # "Up" = +deg (flip using ATT_DIR if needed)
+    await motor.run_for_degrees(ATT, ATT_DIR * abs(deg), speed)
+    motor.stop(ATT, stop=ATT_HOLD)
+
+async def attachment_down(deg=180, speed=ATT_SPEED):
+    await motor.run_for_degrees(ATT, -ATT_DIR * abs(deg), speed)
+    motor.stop(ATT, stop=ATT_HOLD)
+
+async def attachment_goto(pos_deg, speed=ATT_SPEED):
+    # Go to a specific relative position (degrees)
+    cur = motor.relative_position(ATT)
+    delta = pos_deg - cur
+    await motor.run_for_degrees(ATT, delta, speed)
+    motor.stop(ATT, stop=ATT_HOLD)
+
+# =========================
+# GYRO STRAIGHT PID
+# =========================
+async def gyro_straight_cm(cm, max_velocity=DRIVE_MAX_VEL, min_velocity=DRIVE_MIN_VEL,
+                        heading=None, settle_brake=True):
+    """
+    Drive cm while holding heading (deg).
+    cm > 0 forward, cm < 0 backward
+    heading: if None, locks current yaw at start.
+    """
+    direction = 1 if cm >= 0 else -1
+    target_deg = cm_to_motor_deg(cm)
+
+    if heading is None:
+        heading = yaw_deg()
+
+    motor.reset_relative_position(LEFT, 0)
+    motor.reset_relative_position(RIGHT, 0)
+
+    prev_error = 0.0
+    integ = 0.0
+
+    while True:
+        pos = avg_abs_encoder_deg()
+        if pos >= target_deg:
+            break
+
+        error = wrap_angle(yaw_deg() - heading)
+        derr = error - prev_error
+        prev_error = error
+
+        integ += error
+        integ = clamp(integ, -I_CLAMP, I_CLAMP)
+
+        steer = -(KP_STRAIGHT * error + KI_STRAIGHT * integ + KD_STRAIGHT * derr)
+
+        # Reverse-steer fix
+        if direction < 0:
+            steer = -steer
+
+        steer = int(clamp(steer, -MAX_STEER, MAX_STEER))
+
+        v = ramp_speed(pos, target_deg, abs(max_velocity), min_velocity,
+                    DRIVE_ACCEL_ZONE_DEG, DRIVE_SLOW_ZONE_DEG)
+
+        motor_pair.move(PAIR, steer, velocity=direction * v)
+        await runloop.sleep_ms(DT_STRAIGHT_MS)
+
+    motor_pair.stop(PAIR, stop=motor.BRAKE if settle_brake else motor.COAST)
+
+# =========================
+# TURN TO ABSOLUTE HEADING (FAST PD)
+# =========================
+async def turn_to_heading(target_heading,
+                        fast_cap=TURN_FAST_CAP, slow_cap=TURN_SLOW_CAP,
+                        slow_zone=TURN_SLOW_ZONE_DEG, deadband=TURN_DEADBAND):
+    prev_error = 0.0
+
+    while True:
+        y = yaw_deg()
+        error = wrap_angle(target_heading - y)
+
+        if abs(error) <= deadband:
+            break
+
+        derr = error - prev_error
+        prev_error = error
+
+        cap = slow_cap if abs(error) < slow_zone else fast_cap
+
+        v = KP_TURN * error + KD_TURN * derr
+        v = int(clamp(v, -cap, cap))
+
+        # minimum push avoids crawling
+        if v > 0:
+            v = max(v, MIN_TURN_PUSH)
+        else:
+            v = min(v, -MIN_TURN_PUSH)
+
+        motor_pair.move_tank(PAIR, v, -v)
+        await runloop.sleep_ms(DT_TURN_MS)
+
+    motor_pair.stop(PAIR, stop=motor.BRAKE)
+    await runloop.sleep_ms(25)
+
+async def gyro_turn_right(deg):
+    target = yaw_deg() + abs(deg)
+    await turn_to_heading(target)
+
+async def gyro_turn_left(deg):
+    target = yaw_deg() - abs(deg)
+    await turn_to_heading(target)
+
+# =========================
+# SETTLE
+# =========================
+async def settle(ms=40):
+    await runloop.sleep_ms(ms)
+
+# =========================
+# MAIN (EXAMPLE)
+# =========================
+async def main():
+    await gyro_reset_once()
+
+    # Base heading after reset = 0
+    base_heading = 0
+
+    # Optional: zero the attachment position at start
+    attachment_reset_zero()
+
+    # Drive forward straight
+    await gyro_straight_cm(72, max_velocity=360, heading=base_heading)
+    await settle(30)
+
+    # Attachment up
+    #await attachment_up(deg=220, speed=350)
+    #await settle(30)
+
+    # Fast left turn (change degrees to what you need)
+    await gyro_turn_left(90)
+    await settle(30)
+
+    # Drive straight (locks current heading automatically)
+    await gyro_straight_cm(49.5, max_velocity=420, heading=None)
+    await settle(30)
+    
+    await gyro_turn_right(42.5)
+    await settle(30)
+
+    await gyro_straight_cm(-37, max_velocity=550, heading=None)
+    await settle(5)
+    
+   
+   
+    await gyro_straight_cm(9, max_velocity=420, heading=None)
+    await settle(30)
+
+    await gyro_turn_right(45)
+    await settle(30)
+
+
+
+    # Attachment down
+    await attachment_down(deg=300, speed=700)
+    await settle(30)
+
+    await gyro_straight_cm(15, max_velocity=420, heading=None)
+    await settle(30)
+
+    await gyro_turn_left(90)
+    await settle(30)
+
+    await gyro_straight_cm(15, max_velocity=420, heading=None)
+    await settle(30)
+
+    await gyro_turn_left(38)
+    await settle(30)
+
+    await gyro_straight_cm(20, max_velocity=420, heading=None)
+    await settle(30)
+
+    # Attachment up
+    await attachment_up(deg=750, speed=400)
+    await settle(30)
+
+    await gyro_turn_left(18)
+    await settle(30)
+
+    await gyro_straight_cm(-7, max_velocity=420, heading=None)
+    await settle(30)
+
+    await attachment_down(deg=300, speed=600)
+    await settle(30)
+
+    await gyro_turn_right(40)
+    await settle(30)
+
+    await attachment_up(deg=300,speed=600)
+    await settle(20)
+
+    await gyro_turn_right(30)
+    await settle(30)
+
+    await attachment_down(deg=400, speed=600)
+
+
+
+
+
+
+
+runloop.run(main())
