@@ -1,0 +1,493 @@
+# =========================
+# SPIKE PRIME FLL – BEST-IN-CLASS Gyro Drive PID (dt-scaled) + FAST/ACCURATE Gyro Turns (dt-scaled)
+# + Attachment Motor (B)
+#
+# Ports:
+# Drive Left = E
+# Drive Right = A
+# Attachment = B
+#
+# Upgrades (Accuracy 10/10 style):
+# ✅ Straight PID uses real dt (stable even with loop jitter)
+# ✅ Conditional Integral (only when it helps) + anti-windup + leak (no drift creep)
+# ✅ Derivative-on-measurement (uses yaw-rate) => less noise / less overshoot
+# ✅ Static-friction "steer kick" when error is meaningful (snappier correction)
+# ✅ Heading capture when heading=None uses short averaging window (post-turn stability)
+# ✅ Turns: 2-phase profile (fast -> precision), dt-scaled PD with yaw-rate, and stable exit:
+#    - require BOTH |error| small AND |yaw_rate| small for a few loops
+# ✅ Optional yaw low-pass filter to reduce gyro noise
+#
+# NOTE: main() is kept EXACTLY as you provided (no changes).
+# =========================
+
+from hub import port, motion_sensor
+import runloop, motor, motor_pair
+import time
+
+# ----- MOTORS -----
+PAIR = motor_pair.PAIR_1
+LEFT = port.E
+RIGHT = port.A
+ATT = port.B
+motor_pair.pair(PAIR, LEFT, RIGHT)
+
+# =========================
+# TUNING
+# =========================
+
+# Wheel circumference in cm (measure yours for max accuracy)
+WHEEL_CIRCUMFERENCE_CM = 17.6
+
+# Yaw sign (flip if yaw feels reversed)
+YAW_SIGN = 1
+
+# Attachment direction (flip if up/down is reversed)
+ATT_DIR = 1  # set -1 if your "up" goes down
+
+# ----- Straight PID (dt-scaled) -----
+KP_STRAIGHT = 1.15
+KI_STRAIGHT = 0.030
+KD_STRAIGHT = 0.16   # (kept but we also use yaw-rate damping below)
+
+MAX_STEER = 100
+I_CLAMP = 180
+
+# Integral "leak" prevents slow creep
+I_LEAK_PER_SEC = 0.05
+
+# Conditional I (update integral only when it's useful)
+I_ENABLE_ERR_DEG = 6.0       # only integrate if |error| < this
+I_ENABLE_MIN_VEL = 170       # and velocity above this
+
+# Static friction steer kick (helps the robot "bite" and correct)
+STEER_KICK_ERR_DEG = 1.2     # start kick above this error
+STEER_KICK = 8               # extra steer added in error direction
+
+# Extra yaw-rate damping (derivative-on-measurement style)
+# Positive value damps oscillation (uses yaw_rate directly).
+K_YAWRATE_DAMP = 0.25
+
+# Drive speeds
+DRIVE_MAX_VEL = 360
+DRIVE_MIN_VEL = 140
+
+# Ramp zones (in wheel-degrees)
+DRIVE_SLOW_ZONE_DEG = 220
+DRIVE_ACCEL_ZONE_DEG = 180
+
+# Heading capture (when heading=None)
+HEADING_CAPTURE_MS = 70
+HEADING_CAPTURE_SAMPLES = 7
+
+# Optional "micro settle" inside straight function at the start (after heading capture)
+STRAIGHT_START_SETTLE_MS = 20
+
+# Gyro noise smoothing (low-pass alpha)
+# 1.0 = no filtering, 0.70-0.85 typical
+YAW_LPF_ALPHA = 0.78
+
+# ----- Turn control (FAST + PRECISE, dt-scaled) -----
+# We use:
+#  - Kp on error (deg)
+#  - Kd-like term on yaw_rate (deg/sec)
+KP_TURN = 4.0
+K_YAWRATE_TURN = 0.80   # how strongly we brake using yaw_rate
+
+# Two-phase caps
+TURN_FAST_CAP = 360
+TURN_MID_CAP = 220
+TURN_SLOW_CAP = 140
+
+TURN_FAST_TO_MID_DEG = 14   # when |error| < this -> mid cap
+TURN_MID_TO_SLOW_DEG = 7    # when |error| < this -> slow cap
+
+TURN_DEADBAND = 0.8
+TURN_RATE_OK = 8.5          # deg/sec must be under this to count stable
+TURN_STABLE_COUNT = 4
+MIN_TURN_PUSH = 55
+
+# Loop delays
+DT_STRAIGHT_MS = 10
+DT_TURN_MS = 6
+
+# Attachment defaults
+ATT_SPEED = 350
+ATT_HOLD = motor.BRAKE
+
+# =========================
+# HELPERS
+# =========================
+
+def clamp(x, lo, hi):
+    if x < lo:
+        return lo
+    if x > hi:
+        return hi
+    return x
+
+def sgn(x):
+    return 1 if x > 0 else (-1 if x < 0 else 0)
+
+def _ticks_ms():
+    return time.ticks_ms()
+
+def _ticks_diff(a, b):
+    return time.ticks_diff(a, b)
+
+def wrap_angle(err):
+    while err > 180:
+        err -= 360
+    while err < -180:
+        err += 360
+    return err
+
+# =========================
+# YAW + RATE (with optional LPF)
+# =========================
+_yaw_filt = None
+
+# yaw rate estimator state
+_last_yaw = 0.0
+_last_yaw_t = 0
+_yaw_rate_filt = 0.0
+
+# yaw rate LPF alpha (separate from yaw angle LPF)
+YAWRATE_LPF_ALPHA = 0.65  # 0.55-0.75 typical
+
+def yaw_deg_raw():
+    # tilt_angles()[0] is yaw in tenths of degrees (approx)
+    return (motion_sensor.tilt_angles()[0] * -0.1) * YAW_SIGN
+
+def yaw_deg():
+    global _yaw_filt
+    y = yaw_deg_raw()
+    if _yaw_filt is None or YAW_LPF_ALPHA >= 0.999:
+        _yaw_filt = y
+        return y
+    _yaw_filt = (YAW_LPF_ALPHA * _yaw_filt) + ((1.0 - YAW_LPF_ALPHA) * y)
+    return _yaw_filt
+
+def yaw_rate_dps():
+    """
+    Estimated yaw rate in deg/sec (filtered).
+    """
+    global _last_yaw, _last_yaw_t, _yaw_rate_filt
+
+    t = _ticks_ms()
+    y = yaw_deg()
+
+    if _last_yaw_t == 0:
+        _last_yaw = y
+        _last_yaw_t = t
+        _yaw_rate_filt = 0.0
+        return 0.0
+
+    dt_ms = _ticks_diff(t, _last_yaw_t)
+    _last_yaw_t = t
+
+    dt = clamp(dt_ms, 4, 50) / 1000.0
+    dy = wrap_angle(y - _last_yaw)
+    _last_yaw = y
+
+    rate = dy / dt  # deg/sec
+
+    # low-pass filter the rate
+    a = YAWRATE_LPF_ALPHA
+    _yaw_rate_filt = a * _yaw_rate_filt + (1.0 - a) * rate
+    return _yaw_rate_filt
+
+async def gyro_reset_once():
+    global _yaw_filt, _last_yaw, _last_yaw_t, _yaw_rate_filt
+    motion_sensor.reset_yaw(0)
+    _yaw_filt = None
+    _last_yaw_t = 0
+    _yaw_rate_filt = 0.0
+    await runloop.sleep_ms(200)
+    _ = yaw_deg()
+    _ = yaw_rate_dps()
+
+def cm_to_motor_deg(cm):
+    return int((abs(cm) / WHEEL_CIRCUMFERENCE_CM) * 360)
+
+def avg_abs_encoder_deg():
+    l = abs(motor.relative_position(LEFT))
+    r = abs(motor.relative_position(RIGHT))
+    return (l + r) // 2
+
+def ramp_speed(pos_deg, target_deg, max_vel, min_vel, accel_zone, slow_zone):
+    remaining = target_deg - pos_deg
+    if remaining <= 0:
+        return 0
+
+    # accelerate
+    if pos_deg < accel_zone and accel_zone > 0:
+        a = pos_deg / accel_zone
+    else:
+        a = 1.0
+
+    # slow down
+    if remaining < slow_zone and slow_zone > 0:
+        s = remaining / slow_zone
+    else:
+        s = 1.0
+
+    factor = min(a, 1.0) * min(s, 1.0)
+    v = min_vel + (max_vel - min_vel) * factor
+    return int(v)
+
+async def capture_heading_avg():
+    """Capture a stable heading by averaging a few yaw samples."""
+    total = 0.0
+    samples = max(1, HEADING_CAPTURE_SAMPLES)
+    gap = max(1, HEADING_CAPTURE_MS // samples)
+    for _ in range(samples):
+        total += yaw_deg()
+        await runloop.sleep_ms(gap)
+    return total / samples
+
+# =========================
+# ATTACHMENT (MOTOR B)
+# =========================
+
+def attachment_reset_zero():
+    motor.reset_relative_position(ATT, 0)
+
+async def attachment_up(deg=180, speed=ATT_SPEED):
+    await motor.run_for_degrees(ATT, ATT_DIR * abs(deg), speed)
+    motor.stop(ATT, stop=ATT_HOLD)
+
+async def attachment_down(deg=180, speed=ATT_SPEED):
+    await motor.run_for_degrees(ATT, -ATT_DIR * abs(deg), speed)
+    motor.stop(ATT, stop=ATT_HOLD)
+
+async def attachment_goto(pos_deg, speed=ATT_SPEED):
+    cur = motor.relative_position(ATT)
+    delta = pos_deg - cur
+    await motor.run_for_degrees(ATT, delta, speed)
+    motor.stop(ATT, stop=ATT_HOLD)
+
+# =========================
+# GYRO STRAIGHT PID (dt-scaled, conditional I, yaw-rate damping, steer kick)
+# =========================
+async def gyro_straight_cm(cm, max_velocity=DRIVE_MAX_VEL, min_velocity=DRIVE_MIN_VEL,
+                          heading=None, settle_brake=True):
+    """
+    Drive cm while holding heading (deg).
+    cm > 0 forward, cm < 0 backward
+    heading: if None, captures a stable averaged yaw at start (post-turn safe).
+    """
+    direction = 1 if cm >= 0 else -1
+    target_deg = cm_to_motor_deg(cm)
+
+    if heading is None:
+        heading = await capture_heading_avg()
+        if STRAIGHT_START_SETTLE_MS > 0:
+            await runloop.sleep_ms(STRAIGHT_START_SETTLE_MS)
+
+    motor.reset_relative_position(LEFT, 0)
+    motor.reset_relative_position(RIGHT, 0)
+
+    integ = 0.0
+    prev_error = 0.0
+
+    t_prev = _ticks_ms()
+
+    while True:
+        pos = avg_abs_encoder_deg()
+        if pos >= target_deg:
+            break
+
+        # dt
+        t_now = _ticks_ms()
+        dt_ms = _ticks_diff(t_now, t_prev)
+        t_prev = t_now
+        dt = clamp(dt_ms, 5, 40) / 1000.0
+
+        # core signals
+        y = yaw_deg()
+        r = yaw_rate_dps()  # deg/sec (filtered)
+        error = wrap_angle(y - heading)
+
+        # error derivative (kept small weight; mostly we damp with yaw-rate)
+        derr = (error - prev_error) / dt
+        prev_error = error
+
+        # speed profile
+        v = ramp_speed(pos, target_deg, abs(max_velocity), min_velocity,
+                       DRIVE_ACCEL_ZONE_DEG, DRIVE_SLOW_ZONE_DEG)
+
+        # Integral leak + conditional update
+        if I_LEAK_PER_SEC > 0:
+            integ *= (1.0 - clamp(I_LEAK_PER_SEC * dt, 0.0, 0.25))
+
+        if abs(error) < I_ENABLE_ERR_DEG and v > I_ENABLE_MIN_VEL:
+            integ += error * dt
+            integ = clamp(integ, -I_CLAMP, I_CLAMP)
+
+        # PID + yaw-rate damping (derivative-on-measurement)
+        steer = -(KP_STRAIGHT * error + KI_STRAIGHT * integ + KD_STRAIGHT * derr)
+
+        # Add direct yaw-rate damping (smooth + stable)
+        steer += (K_YAWRATE_DAMP * r)
+
+        # Static friction kick (helps correction "bite")
+        if abs(error) >= STEER_KICK_ERR_DEG:
+            steer += -sgn(error) * STEER_KICK
+
+        # Reverse-steer fix
+        if direction < 0:
+            steer = -steer
+
+        steer = int(clamp(steer, -MAX_STEER, MAX_STEER))
+        motor_pair.move(PAIR, steer, velocity=direction * v)
+        await runloop.sleep_ms(DT_STRAIGHT_MS)
+
+    motor_pair.stop(PAIR, stop=motor.BRAKE if settle_brake else motor.COAST)
+
+# =========================
+# TURN TO ABSOLUTE HEADING (2-phase caps, yaw-rate braking, stable exit)
+# =========================
+def _turn_cap_for_error(aerr):
+    # 2-phase (actually 3 caps): fast -> mid -> slow
+    if aerr > TURN_FAST_TO_MID_DEG:
+        return TURN_FAST_CAP
+    if aerr > TURN_MID_TO_SLOW_DEG:
+        return TURN_MID_CAP
+    return TURN_SLOW_CAP
+
+async def turn_to_heading(target_heading,
+                          deadband=TURN_DEADBAND):
+    stable = 0
+
+    while True:
+        y = yaw_deg()
+        r = yaw_rate_dps()  # deg/sec (filtered)
+        error = wrap_angle(target_heading - y)
+        aerr = abs(error)
+
+        # Stable exit: both position and angular velocity must be small
+        if aerr <= deadband and abs(r) <= TURN_RATE_OK:
+            stable += 1
+            if stable >= TURN_STABLE_COUNT:
+                break
+        else:
+            stable = 0
+
+        cap = _turn_cap_for_error(aerr)
+
+        # PD with yaw-rate braking:
+        # v = Kp*error - K_rate * yaw_rate
+        v = (KP_TURN * error) - (K_YAWRATE_TURN * r)
+        v = int(clamp(v, -cap, cap))
+
+        # minimum push (avoid stall) unless extremely close
+        if aerr > deadband * 1.25:
+            if v > 0:
+                v = max(v, MIN_TURN_PUSH)
+            else:
+                v = min(v, -MIN_TURN_PUSH)
+
+        motor_pair.move_tank(PAIR, v, -v)
+        await runloop.sleep_ms(DT_TURN_MS)
+
+    motor_pair.stop(PAIR, stop=motor.BRAKE)
+    await runloop.sleep_ms(25)
+
+async def gyro_turn_right(deg):
+    target = yaw_deg() + abs(deg)
+    await turn_to_heading(target)
+
+async def gyro_turn_left(deg):
+    target = yaw_deg() - abs(deg)
+    await turn_to_heading(target)
+
+# =========================
+# SETTLE
+# =========================
+async def settle(ms=40):
+    await runloop.sleep_ms(ms)
+
+# =========================
+# MAIN — UNCHANGED (as you requested)
+# =========================
+async def main():
+    await gyro_reset_once()
+
+    # Base heading after reset = 0
+    base_heading = 0
+
+    # Optional: zero the attachment position at start
+    attachment_reset_zero()
+
+    # Drive forward straight
+    await gyro_straight_cm(72, max_velocity=360, heading=base_heading)
+    await settle(30)
+
+    # Attachment up
+    #await attachment_up(deg=220, speed=350)
+    #await settle(30)
+
+    # Fast left turn (change degrees to what you need)
+    await gyro_turn_left(90)
+    await settle(30)
+
+    # Drive straight (locks current heading automatically)
+    await gyro_straight_cm(49.5, max_velocity=420, heading=None)
+    await settle(30)
+    
+    await gyro_turn_right(42.5)
+    await settle(30)
+
+    await gyro_straight_cm(-37, max_velocity=550, heading=None)
+    await settle(5)
+    
+    await gyro_straight_cm(9, max_velocity=420, heading=None)
+    await settle(30)
+
+    await gyro_turn_right(45)
+    await settle(30)
+
+    # Attachment down
+    await attachment_down(deg=300, speed=700)
+    await settle(30)
+
+    await gyro_straight_cm(15, max_velocity=420, heading=None)
+    await settle(30)
+
+    await gyro_turn_left(90)
+    await settle(30)
+
+    await gyro_straight_cm(15, max_velocity=420, heading=None)
+    await settle(30)
+
+    await gyro_turn_left(38)
+    await settle(30)
+
+    await gyro_straight_cm(20, max_velocity=420, heading=None)
+    await settle(30)
+
+    # Attachment up
+    await attachment_up(deg=750, speed=400)
+    await settle(30)
+
+    await gyro_turn_left(18)
+    await settle(30)
+
+    await gyro_straight_cm(-7, max_velocity=420, heading=None)
+    await settle(30)
+
+    await attachment_down(deg=300, speed=600)
+    await settle(30)
+
+    await gyro_turn_right(40)
+    await settle(30)
+
+    await attachment_up(deg=300,speed=600)
+    await settle(20)
+
+    await gyro_turn_right(30)
+    await settle(30)
+
+    await attachment_down(deg=400, speed=600)
+
+runloop.run(main())
